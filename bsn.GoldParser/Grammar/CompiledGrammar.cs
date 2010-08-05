@@ -2,10 +2,10 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace bsn.GoldParser.Grammar {
 	/// <summary>
@@ -49,6 +49,134 @@ namespace bsn.GoldParser.Grammar {
 			internal DfaEdge(int charSetIndex, int targetIndex) {
 				CharSetIndex = charSetIndex;
 				TargetIndex = targetIndex;
+			}
+		}
+
+		private class LoadContext {
+			private readonly BinaryReader reader;
+			private int dfaInitialStateIndex; // DFA initial state index
+			private int entryCount; // Number of entries left
+			private int lrInitialState; // LR initial state
+			private int startSymbolIndex; // Start symbol index
+
+			public LoadContext(BinaryReader reader) {
+				if (reader == null) {
+					throw new ArgumentNullException("reader");
+				}
+				this.reader = reader;
+			}
+
+			public int DfaInitialStateIndex {
+				get {
+					return dfaInitialStateIndex;
+				}
+				set {
+					dfaInitialStateIndex = value;
+				}
+			}
+
+			public int EntryCount {
+				get {
+					return entryCount;
+				}
+			}
+
+			public int LrInitialState {
+				get {
+					return lrInitialState;
+				}
+				set {
+					lrInitialState = value;
+				}
+			}
+
+			public int StartSymbolIndex {
+				get {
+					return startSymbolIndex;
+				}
+				set {
+					startSymbolIndex = value;
+				}
+			}
+
+			public bool HasMoreData() {
+				return reader.PeekChar() != -1;
+			}
+
+			public bool ReadBoolEntry() {
+				if (ReadEntryType() != EntryType.Boolean) {
+					throw new FileLoadException("Boolean entry expected");
+				}
+				entryCount--;
+				return reader.ReadBoolean();
+			}
+
+			public void ReadEmptyEntry() {
+				if (ReadEntryType() != EntryType.Empty) {
+					throw new FileLoadException("Empty entry expected");
+				}
+				entryCount--;
+			}
+
+			public string ReadHeaderString() {
+				if (entryCount != 0) {
+					throw new FileLoadException("Header expected");
+				}
+				return ReadString();
+			}
+
+			public int ReadInt16Entry() {
+				if (ReadEntryType() != EntryType.Integer) {
+					throw new FileLoadException("Integer entry expected");
+				}
+				entryCount--;
+				return reader.ReadUInt16();
+			}
+
+			public RecordType ReadNextRecord() {
+				char recordType = (char)reader.ReadByte();
+				//Structure below is ready for future expansion
+				switch (recordType) {
+				case 'M':
+					//Read the number of entry's
+					entryCount = reader.ReadUInt16();
+					return (RecordType)ReadByteEntry();
+				default:
+					throw new FileLoadException("Invalid record header");
+				}
+			}
+
+			public string ReadStringEntry() {
+				if (ReadEntryType() != EntryType.String) {
+					throw new FileLoadException("String entry expected");
+				}
+				entryCount--;
+				return ReadString();
+			}
+
+			private byte ReadByteEntry() {
+				if (ReadEntryType() != EntryType.Byte) {
+					throw new FileLoadException("Byte entry expected");
+				}
+				entryCount--;
+				return reader.ReadByte();
+			}
+
+			private EntryType ReadEntryType() {
+				if (entryCount <= 0) {
+					throw new FileLoadException("No entry found");
+				}
+				return (EntryType)reader.ReadByte();
+			}
+
+			private string ReadString() {
+				StringBuilder result = new StringBuilder();
+				char unicodeChar = (char)reader.ReadUInt16();
+				while (unicodeChar != (char)0) {
+					result.Append(unicodeChar);
+					unicodeChar = (char)reader.ReadUInt16();
+				}
+				return result.ToString();
 			}
 		}
 
@@ -111,31 +239,24 @@ namespace bsn.GoldParser.Grammar {
 			}
 		}
 
-		private readonly BinaryReader reader; // Source of the grammar    
 		private readonly object sync = new object();
-
-		// Grammar header information
 		private string about; // Grammar description
 		private string author; // Author of the grammar
+		private ICollection<DfaState> blockCommentStates;
 		private bool caseSensitive; // Grammar is case sensitive or not
-
-		// Tables read from the binary grammar file
 		private String[] charSetTable; // Charset table
 		private DfaState dfaInitialState; // DFA initial state 
-		private int dfaInitialStateIndex; // DFA initial state index
 		private DfaState[] dfaStateTable; // DFA state table
 		private Symbol endSymbol;
-		private int entryCount; // Number of entries left
 		private Symbol errorSymbol;
+		private LalrState lalrInitialState; // LR state table
 		private LalrState[] lalrStateTable; // LR state table
-		private int lrInitialState; // LR initial state
 		private string name; // Name of the grammar
 		private Rule[] ruleTable; // Rule table
 		private Dictionary<Symbol, ReadOnlyCollection<Rule>> rules;
-		private int startSymbolIndex; // Start symbol index
+		private Symbol startSymbol;
+		private Dictionary<DfaState, ReadOnlyCollection<DfaState>> stateOrigins;
 		private Symbol[] symbolTable; // Symbol table
-
-		// helper data structures for optimized access/query
 		private Dictionary<string, Symbol> symbols;
 		private string version; // Version of the grammar
 
@@ -147,9 +268,7 @@ namespace bsn.GoldParser.Grammar {
 			if (reader == null) {
 				throw new ArgumentNullException("reader");
 			}
-
-			this.reader = reader;
-			Load();
+			Load(new LoadContext(reader));
 		}
 
 		/// <summary>
@@ -170,6 +289,12 @@ namespace bsn.GoldParser.Grammar {
 			}
 		}
 
+		public ICollection<DfaState> BlockCommentStates {
+			get {
+				return blockCommentStates;
+			}
+		}
+
 		/// <summary>
 		/// Gets the value indicating if the grammar is case sensitive.
 		/// </summary>
@@ -180,11 +305,31 @@ namespace bsn.GoldParser.Grammar {
 		}
 
 		/// <summary>
+		/// Gets the dfa charset count.
+		/// </summary>
+		/// <value>The dfa charset count.</value>
+		public int DfaCharsetCount {
+			get {
+				return charSetTable.Length;
+			}
+		}
+
+		/// <summary>
 		/// Gets initial DFA state.
 		/// </summary>
 		public DfaState DfaInitialState {
 			get {
 				return dfaInitialState;
+			}
+		}
+
+		/// <summary>
+		/// Gets the dfa state count.
+		/// </summary>
+		/// <value>The dfa state count.</value>
+		public int DfaStateCount {
+			get {
+				return dfaStateTable.Length;
 			}
 		}
 
@@ -212,54 +357,7 @@ namespace bsn.GoldParser.Grammar {
 		/// </summary>
 		public LalrState InitialLRState {
 			get {
-				return lalrStateTable[lrInitialState];
-			}
-		}
-
-		/// <summary>
-		/// Gets grammar name.
-		/// </summary>
-		public string Name {
-			get {
-				return name;
-			}
-		}
-
-		/// <summary>
-		/// Gets the start symbol for the grammar.
-		/// </summary>
-		public Symbol StartSymbol {
-			get {
-				return symbolTable[startSymbolIndex];
-			}
-		}
-
-		/// <summary>
-		/// Gets grammar version.
-		/// </summary>
-		public string Version {
-			get {
-				return version;
-			}
-		}
-
-		/// <summary>
-		/// Gets the dfa charset count.
-		/// </summary>
-		/// <value>The dfa charset count.</value>
-		public int DfaCharsetCount {
-			get {
-				return charSetTable.Length;
-			}
-		}
-
-		/// <summary>
-		/// Gets the dfa state count.
-		/// </summary>
-		/// <value>The dfa state count.</value>
-		public int DfaStateCount {
-			get {
-				return dfaStateTable.Length;
+				return lalrInitialState;
 			}
 		}
 
@@ -274,12 +372,30 @@ namespace bsn.GoldParser.Grammar {
 		}
 
 		/// <summary>
+		/// Gets grammar name.
+		/// </summary>
+		public string Name {
+			get {
+				return name;
+			}
+		}
+
+		/// <summary>
 		/// Gets the rule count.
 		/// </summary>
 		/// <value>The rule count.</value>
 		public int RuleCount {
 			get {
 				return ruleTable.Length;
+			}
+		}
+
+		/// <summary>
+		/// Gets the start symbol for the grammar.
+		/// </summary>
+		public Symbol StartSymbol {
+			get {
+				return startSymbol;
 			}
 		}
 
@@ -291,6 +407,89 @@ namespace bsn.GoldParser.Grammar {
 			get {
 				return symbolTable.Length;
 			}
+		}
+
+		/// <summary>
+		/// Gets grammar version.
+		/// </summary>
+		public string Version {
+			get {
+				return version;
+			}
+		}
+
+		/// <summary>
+		/// Gets the dfa charset.
+		/// </summary>
+		/// <param name="charSetIndex">Index of the char set.</param>
+		/// <returns></returns>
+		public string GetDfaCharset(int charSetIndex) {
+			return charSetTable[charSetIndex];
+		}
+
+		/// <summary>
+		/// Gets the state of the dfa.
+		/// </summary>
+		/// <param name="index">The index.</param>
+		/// <returns></returns>
+		public DfaState GetDfaState(int index) {
+			return dfaStateTable[index];
+		}
+
+		public ICollection<DfaState> GetDfaStatesOfSymbols(Predicate<Symbol> filter) {
+			int symbolsFound = 0;
+			SymbolSet acceptSymbols = new SymbolSet();
+			for (int i = 0; i < SymbolCount; i++) {
+				Symbol symbol = GetSymbol(i);
+				switch (symbol.Kind) {
+				case SymbolKind.CommentStart:
+				case SymbolKind.CommentEnd:
+					acceptSymbols[symbol] = true;
+					symbolsFound++;
+					break;
+				}
+			}
+			if (symbolsFound != 0) {
+				Queue<DfaState> stateQueue = new Queue<DfaState>();
+				for (int i = 0; i < DfaStateCount; i++) {
+					DfaState state = GetDfaState(i);
+					if (acceptSymbols[state.AcceptSymbol]) {
+						stateQueue.Enqueue(state);
+					}
+				}
+				Debug.Assert(stateQueue.Count >= symbolsFound);
+				Dictionary<DfaState, int> allowedStates = new Dictionary<DfaState, int>();
+				do {
+					DfaState state = stateQueue.Dequeue();
+					int count;
+					if (!allowedStates.TryGetValue(state, out count)) {
+						foreach (DfaState originState in state.GetOriginStates()) {
+							stateQueue.Enqueue(originState);
+						}
+					}
+					allowedStates[state] = count+1;
+				} while (stateQueue.Count > 0);
+				return allowedStates.Keys;
+			}
+			return new DfaState[0];
+		}
+
+		/// <summary>
+		/// Gets the state of the lalr.
+		/// </summary>
+		/// <param name="index">The index.</param>
+		/// <returns></returns>
+		public LalrState GetLalrState(int index) {
+			return lalrStateTable[index];
+		}
+
+		/// <summary>
+		/// Gets the rule.
+		/// </summary>
+		/// <param name="index">The index.</param>
+		/// <returns></returns>
+		public Rule GetRule(int index) {
+			return ruleTable[index];
 		}
 
 		/// <summary>
@@ -307,6 +506,15 @@ namespace bsn.GoldParser.Grammar {
 		}
 
 		/// <summary>
+		/// Gets the symbol.
+		/// </summary>
+		/// <param name="symbolIndex">Index of the symbol.</param>
+		/// <returns></returns>
+		public Symbol GetSymbol(int symbolIndex) {
+			return symbolTable[symbolIndex];
+		}
+
+		/// <summary>
 		/// Gets the symbol with the specified name.
 		/// </summary>
 		/// <param name="symbolName">Name of the symbol (including <c>&lt; &gt;</c> for non-terminals) .</param>
@@ -318,6 +526,10 @@ namespace bsn.GoldParser.Grammar {
 				throw new ArgumentException("No symbol exists with the given name", "symbolName");
 			}
 			return result;
+		}
+
+		public override string ToString() {
+			return Name;
 		}
 
 		/// <summary>
@@ -356,48 +568,20 @@ namespace bsn.GoldParser.Grammar {
 		}
 
 		/// <summary>
-		/// Gets the dfa charset.
+		/// Gets the state transition origin states.
 		/// </summary>
-		/// <param name="charSetIndex">Index of the char set.</param>
+		/// <param name="state">The state to get the transitions origin vectors for.</param>
 		/// <returns></returns>
-		public string GetDfaCharset(int charSetIndex) {
-			return charSetTable[charSetIndex];
-		}
-
-		/// <summary>
-		/// Gets the state of the dfa.
-		/// </summary>
-		/// <param name="index">The index.</param>
-		/// <returns></returns>
-		public DfaState GetDfaState(int index) {
-			return dfaStateTable[index];
-		}
-
-		/// <summary>
-		/// Gets the state of the lalr.
-		/// </summary>
-		/// <param name="index">The index.</param>
-		/// <returns></returns>
-		public LalrState GetLalrState(int index) {
-			return lalrStateTable[index];
-		}
-
-		/// <summary>
-		/// Gets the rule.
-		/// </summary>
-		/// <param name="index">The index.</param>
-		/// <returns></returns>
-		public Rule GetRule(int index) {
-			return ruleTable[index];
-		}
-
-		/// <summary>
-		/// Gets the symbol.
-		/// </summary>
-		/// <param name="symbolIndex">Index of the symbol.</param>
-		/// <returns></returns>
-		public Symbol GetSymbol(int symbolIndex) {
-			return symbolTable[symbolIndex];
+		internal ReadOnlyCollection<DfaState> GetStateOrigins(DfaState state) {
+			if (state == null) {
+				throw new ArgumentNullException("state");
+			}
+			InitializeStateOriginLookup();
+			ReadOnlyCollection<DfaState> result;
+			if (!stateOrigins.TryGetValue(state, out result)) {
+				throw new ArgumentException("The state is not valid", "state");
+			}
+			return result;
 		}
 
 		private void InitializeRuleLookup() {
@@ -420,6 +604,35 @@ namespace bsn.GoldParser.Grammar {
 			}
 		}
 
+		private void InitializeStateOriginLookup() {
+			lock (sync) {
+				if (stateOrigins == null) {
+					Dictionary<DfaState, List<DfaState>> stateOriginTemp = new Dictionary<DfaState, List<DfaState>>(dfaStateTable.Length);
+					foreach (DfaState state in dfaStateTable) {
+						foreach (DfaState transitionState in state.GetTransitionStates()) {
+							List<DfaState> originList;
+							if (!stateOriginTemp.TryGetValue(transitionState, out originList)) {
+								originList = new List<DfaState>();
+								stateOriginTemp.Add(transitionState, originList);
+							}
+							originList.Add(state);
+						}
+					}
+					stateOrigins = new Dictionary<DfaState, ReadOnlyCollection<DfaState>>(dfaStateTable.Length);
+					foreach (DfaState state in dfaStateTable) {
+						DfaState[] origins;
+						List<DfaState> originList;
+						if (stateOriginTemp.TryGetValue(state, out originList)) {
+							origins = originList.ToArray();
+						} else {
+							origins = new DfaState[0];
+						}
+						stateOrigins.Add(state, Array.AsReadOnly(origins));
+					}
+				}
+			}
+		}
+
 		private void InitializeSymbolLookup() {
 			lock (sync) {
 				if (symbols == null) {
@@ -434,118 +647,75 @@ namespace bsn.GoldParser.Grammar {
 		/// <summary>
 		/// Loads grammar from the binary reader.
 		/// </summary>
-		private void Load() {
-			if (FileHeader != ReadString()) {
+		private void Load(LoadContext context) {
+			if (FileHeader != context.ReadHeaderString()) {
 				throw new FileLoadException("The File Header is invalid");
 			}
-			while (reader.PeekChar() != -1) {
-				RecordType recordType = ReadNextRecord();
+			while (context.HasMoreData()) {
+				RecordType recordType = context.ReadNextRecord();
 				switch (recordType) {
 				case RecordType.Parameters:
-					ReadHeader();
+					ReadHeader(context);
 					break;
-
 				case RecordType.TableCounts:
-					ReadTableCounts();
+					ReadTableCounts(context);
 					break;
-
 				case RecordType.Initial:
-					ReadInitialStates();
+					ReadInitialStates(context);
 					break;
-
 				case RecordType.Symbols:
-					ReadSymbols();
+					ReadSymbols(context);
 					break;
-
 				case RecordType.CharSets:
-					ReadCharSets();
+					ReadCharSets(context);
 					break;
-
 				case RecordType.Rules:
-					ReadRules();
+					ReadRules(context);
 					break;
-
 				case RecordType.DfaStates:
-					ReadDfaStates();
+					ReadDfaStates(context);
 					break;
-
 				case RecordType.LRStates:
-					ReadLRStates();
+					ReadLRStates(context);
 					break;
-
 				default:
 					throw new FileLoadException("Invalid record count");
 				}
 			}
-			dfaInitialState = dfaStateTable[dfaInitialStateIndex];
-		}
-
-		/// <summary>
-		/// Reads boolean from the grammar file.
-		/// </summary>
-		/// <returns>Boolean value.</returns>
-		private bool ReadBool() {
-			return (ReadByte() == 1);
-		}
-
-		/// <summary>
-		/// Reads boolean entry from the grammar file.
-		/// </summary>
-		/// <returns>Boolean entry content.</returns>
-		private bool ReadBoolEntry() {
-			if (ReadEntryType() != EntryType.Boolean) {
-				throw new FileLoadException("Boolean entry expected");
-			}
-			entryCount--;
-			return ReadBool();
-		}
-
-		/// <summary>
-		/// Reads byte from the grammar file.
-		/// </summary>
-		/// <returns>Byte value.</returns>
-		private byte ReadByte() {
-			return reader.ReadByte();
-		}
-
-		/// <summary>
-		/// Reads byte entry from the grammar file.
-		/// </summary>
-		/// <returns>Byte entry content.</returns>
-		private byte ReadByteEntry() {
-			if (ReadEntryType() != EntryType.Byte) {
-				throw new FileLoadException("Byte entry expected");
-			}
-			entryCount--;
-			return ReadByte();
+			dfaInitialState = dfaStateTable[context.DfaInitialStateIndex];
+			startSymbol = symbolTable[context.StartSymbolIndex];
+			lalrInitialState = lalrStateTable[context.LrInitialState];
+			blockCommentStates = GetDfaStatesOfSymbols(symbol => (symbol.Kind == SymbolKind.CommentStart) || (symbol.Kind == SymbolKind.CommentEnd));
 		}
 
 		/// <summary>
 		/// Read char set information.
 		/// </summary>
-		private void ReadCharSets() {
-			charSetTable[ReadInt16Entry()] = ReadStringEntry();
+		/// <param name="context"></param>
+		private void ReadCharSets(LoadContext context) {
+			charSetTable[context.ReadInt16Entry()] = context.ReadStringEntry();
 		}
 
 		/// <summary>
 		/// Read DFA state information.
 		/// </summary>
-		private void ReadDfaStates() {
-			DfaState dfaState = GetDfaState(ReadInt16Entry());
+		/// <param name="context"></param>
+		private void ReadDfaStates(LoadContext context) {
+			DfaState dfaState = GetDfaState(context.ReadInt16Entry());
 			Symbol acceptSymbol = null;
-			bool acceptState = ReadBoolEntry();
+			bool acceptState = context.ReadBoolEntry();
 			if (acceptState) {
-				acceptSymbol = symbolTable[ReadInt16Entry()];
+				acceptSymbol = symbolTable[context.ReadInt16Entry()];
 			} else {
-				ReadInt16Entry(); // Skip the entry.
+				context.ReadInt16Entry(); // Skip the entry.
 			}
-			ReadEmptyEntry();
+			context.ReadEmptyEntry();
 
 			// Read DFA edges
-			DfaEdge[] edges = new DfaEdge[entryCount/3];
+			DfaEdge[] edges = new DfaEdge[context.EntryCount/3];
 			for (int i = 0; i < edges.Length; i++) {
-				edges[i] = new DfaEdge(ReadInt16Entry(), ReadInt16Entry());
-				ReadEmptyEntry();
+				edges[i] = new DfaEdge(context.ReadInt16Entry(), context.ReadInt16Entry());
+				context.ReadEmptyEntry();
 			}
 
 			// Create DFA state and store it in DFA state table
@@ -553,78 +723,40 @@ namespace bsn.GoldParser.Grammar {
 		}
 
 		/// <summary>
-		/// Reads empty entry from the grammar file.
-		/// </summary>
-		private void ReadEmptyEntry() {
-			if (ReadEntryType() != EntryType.Empty) {
-				throw new FileLoadException("Empty entry expected");
-			}
-			entryCount--;
-		}
-
-		/// <summary>
-		/// Reads entry type.
-		/// </summary>
-		/// <returns>Entry type.</returns>
-		private EntryType ReadEntryType() {
-			if (entryCount == 0) {
-				throw new FileLoadException("No entry found");
-			}
-			return (EntryType)ReadByte();
-		}
-
-		/// <summary>
 		/// Reads grammar header information.
 		/// </summary>
-		private void ReadHeader() {
-			name = ReadStringEntry();
-			version = ReadStringEntry();
-			author = ReadStringEntry();
-			about = ReadStringEntry();
-			caseSensitive = ReadBoolEntry();
-			startSymbolIndex = ReadInt16Entry();
+		/// <param name="context"></param>
+		private void ReadHeader(LoadContext context) {
+			name = context.ReadStringEntry();
+			version = context.ReadStringEntry();
+			author = context.ReadStringEntry();
+			about = context.ReadStringEntry();
+			caseSensitive = context.ReadBoolEntry();
+			context.StartSymbolIndex = context.ReadInt16Entry();
 		}
 
 		/// <summary>
 		/// Read initial DFA and LR states.
 		/// </summary>
-		private void ReadInitialStates() {
-			dfaInitialStateIndex = ReadInt16Entry();
-			lrInitialState = ReadInt16Entry();
-		}
-
-		/// <summary>
-		/// Reads two byte integer Int16 from the grammar file.
-		/// </summary>
-		/// <returns>Int16 value.</returns>
-		private int ReadInt16() {
-			return reader.ReadUInt16();
-		}
-
-		/// <summary>
-		/// Reads Int16 entry from the grammar file.
-		/// </summary>
-		/// <returns>Int16 entry content.</returns>
-		private int ReadInt16Entry() {
-			if (ReadEntryType() != EntryType.Integer) {
-				throw new FileLoadException("Integer entry expected");
-			}
-			entryCount--;
-			return ReadInt16();
+		/// <param name="context"></param>
+		private void ReadInitialStates(LoadContext context) {
+			context.DfaInitialStateIndex = context.ReadInt16Entry();
+			context.LrInitialState = context.ReadInt16Entry();
 		}
 
 		/// <summary>
 		/// Read LR state information.
 		/// </summary>
-		private void ReadLRStates() {
-			int index = ReadInt16Entry();
-			ReadEmptyEntry();
-			LalrAction[] table = new LalrAction[entryCount/4];
+		/// <param name="context"></param>
+		private void ReadLRStates(LoadContext context) {
+			int index = context.ReadInt16Entry();
+			context.ReadEmptyEntry();
+			LalrAction[] table = new LalrAction[context.EntryCount/4];
 			for (int i = 0; i < table.Length; i++) {
-				Symbol symbol = symbolTable[ReadInt16Entry()];
-				LalrActionType actionType = (LalrActionType)ReadInt16Entry();
-				int targetIndex = ReadInt16Entry();
-				ReadEmptyEntry();
+				Symbol symbol = symbolTable[context.ReadInt16Entry()];
+				LalrActionType actionType = (LalrActionType)context.ReadInt16Entry();
+				int targetIndex = context.ReadInt16Entry();
+				context.ReadEmptyEntry();
 				LalrAction action;
 				switch (actionType) {
 				case LalrActionType.Accept:
@@ -644,7 +776,6 @@ namespace bsn.GoldParser.Grammar {
 				}
 				table[i] = action;
 			}
-
 			// Create the transition vector
 			LalrAction[] transitionVector = new LalrAction[symbolTable.Length];
 			for (int i = 0; i < transitionVector.Length; i++) {
@@ -657,76 +788,33 @@ namespace bsn.GoldParser.Grammar {
 		}
 
 		/// <summary>
-		/// Reads the next record in the binary grammar file.
-		/// </summary>
-		/// <returns>Read record type.</returns>
-		private RecordType ReadNextRecord() {
-			char recordType = (char)ReadByte();
-			//Structure below is ready for future expansion
-			switch (recordType) {
-			case 'M':
-				//Read the number of entry's
-				entryCount = ReadInt16();
-				return (RecordType)ReadByteEntry();
-
-			default:
-				throw new FileLoadException("Invalid record header");
-			}
-		}
-
-		/// <summary>
 		/// Read rule information.
 		/// </summary>
-		private void ReadRules() {
-			int index = ReadInt16Entry();
-			Symbol nonterminal = symbolTable[ReadInt16Entry()];
-			ReadEmptyEntry();
-			Symbol[] symbols = new Symbol[entryCount];
+		/// <param name="context"></param>
+		private void ReadRules(LoadContext context) {
+			int index = context.ReadInt16Entry();
+			Symbol nonterminal = symbolTable[context.ReadInt16Entry()];
+			context.ReadEmptyEntry();
+			Symbol[] symbols = new Symbol[context.EntryCount];
 			for (int i = 0; i < symbols.Length; i++) {
-				symbols[i] = symbolTable[ReadInt16Entry()];
+				symbols[i] = symbolTable[context.ReadInt16Entry()];
 			}
 			GetRule(index).Initialize(nonterminal, symbols);
 		}
 
 		/// <summary>
-		/// Reads string from the grammar file.
-		/// </summary>
-		/// <returns>String value.</returns>
-		private string ReadString() {
-			StringBuilder result = new StringBuilder();
-			char unicodeChar = (char)ReadInt16();
-			while (unicodeChar != (char)0) {
-				result.Append(unicodeChar);
-				unicodeChar = (char)ReadInt16();
-			}
-			return result.ToString();
-		}
-
-		/// <summary>
-		/// Reads string entry from the grammar file.
-		/// </summary>
-		/// <returns>String entry content.</returns>
-		private string ReadStringEntry() {
-			if (ReadEntryType() != EntryType.String) {
-				throw new FileLoadException("String entry expected");
-			}
-			entryCount--;
-			return ReadString();
-		}
-
-		/// <summary>
 		/// Read symbol information.
 		/// </summary>
-		private void ReadSymbols() {
-			int index = ReadInt16Entry();
-			string name = ReadStringEntry();
-			SymbolKind symbolKind = (SymbolKind)ReadInt16Entry();
+		/// <param name="context"></param>
+		private void ReadSymbols(LoadContext context) {
+			int index = context.ReadInt16Entry();
+			string name = context.ReadStringEntry();
+			SymbolKind symbolKind = (SymbolKind)context.ReadInt16Entry();
 			Symbol symbol = new Symbol(this, index, name, symbolKind);
 			switch (symbolKind) {
 			case SymbolKind.Error:
 				errorSymbol = symbol;
 				break;
-
 			case SymbolKind.End:
 				endSymbol = symbol;
 				break;
@@ -737,26 +825,23 @@ namespace bsn.GoldParser.Grammar {
 		/// <summary>
 		/// Reads table record counts and initializes tables.
 		/// </summary>
-		private void ReadTableCounts() {
+		/// <param name="context"></param>
+		private void ReadTableCounts(LoadContext context) {
 			// Initialize tables
-			symbolTable = new Symbol[ReadInt16Entry()];
-			charSetTable = new String[ReadInt16Entry()];
-			ruleTable = new Rule[ReadInt16Entry()];
+			symbolTable = new Symbol[context.ReadInt16Entry()];
+			charSetTable = new String[context.ReadInt16Entry()];
+			ruleTable = new Rule[context.ReadInt16Entry()];
 			for (int i = 0; i < ruleTable.Length; i++) {
 				ruleTable[i] = new Rule(this, i);
 			}
-			dfaStateTable = new DfaState[ReadInt16Entry()];
+			dfaStateTable = new DfaState[context.ReadInt16Entry()];
 			for (int i = 0; i < dfaStateTable.Length; i++) {
 				dfaStateTable[i] = new DfaState(this, i);
 			}
-			lalrStateTable = new LalrState[ReadInt16Entry()];
+			lalrStateTable = new LalrState[context.ReadInt16Entry()];
 			for (int i = 0; i < lalrStateTable.Length; i++) {
 				lalrStateTable[i] = new LalrState(this, i);
 			}
-		}
-
-		public override string ToString() {
-			return Name;
 		}
 	}
 }
