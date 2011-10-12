@@ -1,0 +1,46 @@
+﻿"Name"     = Text Calculator Grammar
+"Author"   = Robert van Loenhout and Arsène von Wyss
+"Version"  = 1.1
+"About"    = 'Example for testing Gold Parser Engine'
+
+"Start Symbol" = <Root>
+"Auto Whitespace" = True
+"Character Mapping" = 'Unicode'
+
+Comment Start = '/*'
+Comment End   = '*/'
+Comment Line  = '--'
+
+! ------------------------------------------------- Sets
+
+! ------------------------------------------------- Terminals
+
+{String Ch} = {All Valid} - {Control Codes} - ['']
+
+Integer = {Digit}+
+Float = {Digit}*'.'{Digit}+([Ee][+-]?{Digit}+)?
+String = (''{String Ch}*'')+
+
+! ------------------------------------------------- Rules
+
+<Root>        ::= <Expression>
+                | <Empty>
+
+<Empty>       ::= NULL
+                | String
+                |
+
+<Expression>  ::= <Expression> '+' <Mult Exp>
+                | <Expression> '-' <Mult Exp>
+                | <Mult Exp> 
+
+<Mult Exp>    ::= <Mult Exp> '*' <Negate Exp>
+                | <Mult Exp> '/' <Negate Exp>
+                | <Negate Exp> 
+
+<Negate Exp>  ::= '-' <Value> 
+                | <Value> 
+
+<Value>       ::= Integer
+                | Float
+                | '(' <Expression> ')'
